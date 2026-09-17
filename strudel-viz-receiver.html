@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>strudel viz receiver</title>
+<style>
+  :root {
+    --bg: #050a06;
+    --panel: #0a130c;
+    --green: #39ff6a;
+    --green-dim: #1f7a3a;
+    --green-faint: #0f3d1d;
+    --red: #ff5c5c;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg);
+    color: var(--green);
+    font-family: 'Courier New', ui-monospace, 'JetBrains Mono', monospace;
+  }
+  body { display: flex; flex-direction: column; min-height: 100vh; }
+  body::before {
+    content: "";
+    position: fixed; inset: 0; pointer-events: none; z-index: 50;
+    background: repeating-linear-gradient(to bottom,
+      rgba(57,255,106,0.03) 0px, rgba(57,255,106,0.03) 1px, transparent 2px, transparent 3px);
+  }
+  header {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--green-faint);
+    display: flex; justify-content: space-between; align-items: baseline;
+    flex-wrap: wrap; gap: 6px;
+  }
+  header h1 {
+    font-size: 14px; margin: 0; font-weight: normal;
+    text-shadow: 0 0 6px rgba(57,255,106,0.5);
+  }
+  #connbar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--green-faint);
+    font-size: 11px;
+    flex-wrap: wrap;
+  }
+  #connbar input {
+    background: var(--panel);
+    color: var(--green);
+    border: 1px solid var(--green-dim);
+    border-radius: 3px;
+    padding: 5px 8px;
+    font-family: inherit;
+    font-size: 11px;
+    width: 220px;
+  }
+  #connbar button {
+    background: var(--panel);
+    color: var(--green);
+    border: 1px solid var(--green-dim);
+    border-radius: 3px;
+    padding: 6px 12px;
+    font-family: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    min-height: 32px;
+  }
+  #dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--red); display: inline-block;
+    box-shadow: 0 0 6px currentColor;
+  }
+  #dot.live { background: var(--green); }
+  #statusText { color: var(--green-dim); }
+  #canvas-wrap { flex: 1; position: relative; min-height: 300px; }
+  #canvas-wrap canvas { display: block; width: 100%; height: 100%; }
+  #hud {
+    position: absolute; bottom: 8px; left: 10px;
+    font-size: 10px; color: var(--green-dim);
+    max-width: 90%;
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+    z-index: 5;
+  }
+  #scopeCanvas {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    z-index: 4;
+  }
+  #codeCanvas {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    z-index: 6;
+    mix-blend-mode: screen;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>strudel viz receiver // three.js</h1>
+  <span style="font-size:11px;color:var(--green-dim);">strudel.ccタブの演奏を中継サーバー経由で受信・可視化</span>
+</header>
+
+<div id="connbar">
+  <span id="dot"></span>
+  <span id="statusText">disconnected</span>
+  <input id="wsUrl" value="ws://localhost:8181" />
+  <button id="btnConnect">CONNECT</button>
+</div>
+
+<div id="canvas-wrap">
+  <div id="hud">waiting for haps...</div>
+  <canvas id="scopeCanvas"></canvas>
+  <canvas id="codeCanvas"></canvas>
+</div>
+
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js';
+
+const wrap = document.getElementById('canvas-wrap');
+const dot = document.getElementById('dot');
+const statusText = document.getElementById('statusText');
+const wsUrlInput = document.getElementById('wsUrl');
+const btnConnect = document.getElementById('btnConnect');
+const hud = document.getElementById('hud');
+const scopeCanvas = document.getElementById('scopeCanvas');
+const scopeCtx = scopeCanvas.getContext('2d');
+const codeCanvas = document.getElementById('codeCanvas');
+
+function resizeScopeCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  scopeCanvas.width = wrap.clientWidth * dpr;
+  scopeCanvas.height = wrap.clientHeight * dpr;
+  scopeCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+resizeScopeCanvas();
+
+const scene = new THREE.Scene();
+const BASE_FOG_DENSITY = 0.035;
+scene.fog = new THREE.FogExp2(0x030503, BASE_FOG_DENSITY);
+
+// 背景と霧の基本色を固定で設定
+const bgR = 0.0, bgG = 0.02, bgB = 0.015;
+scene.fog.color.setRGB(bgR, bgG, bgB);
+
+const camera = new THREE.PerspectiveCamera(50, wrap.clientWidth / wrap.clientHeight, 0.1, 200);
+camera.position.set(0, 6, 16);
+camera.lookAt(0, 0, -10);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(wrap.clientWidth, wrap.clientHeight);
+renderer.setClearColor(new THREE.Color(bgR, bgG, bgB));
+wrap.appendChild(renderer.domElement);
+
+const BASE_AMBIENT_INTENSITY = 1.2;
+const ambientLight = new THREE.AmbientLight(0x0f3d1d, BASE_AMBIENT_INTENSITY);
+scene.add(ambientLight);
+
+const BASE_POINT_INTENSITY = 2.2;
+const BASE_POINT_DISTANCE = 50;
+const pointLight = new THREE.PointLight(0x39ff6a, BASE_POINT_INTENSITY, BASE_POINT_DISTANCE);
+pointLight.position.set(0, 8, 4);
+scene.add(pointLight);
+
+const rollGroup = new THREE.Group();
+scene.add(rollGroup);
+const noteGeo = new THREE.SphereGeometry(0.35, 20, 20);
+const ROLL_SPEED = 4.0;
+const LIFE = 3.0;
+const notePool = [];
+
+function spawnNoteBall(hue, xPos, gain) {
+  let ball = notePool.find((b) => !b.userData.active);
+  if (!ball) {
+    const mat = new THREE.MeshStandardMaterial({ emissive: 0x39ff6a, emissiveIntensity: 1.2, color: 0x0f3d1d });
+    ball = new THREE.Mesh(noteGeo, mat);
+    rollGroup.add(ball);
+    notePool.push(ball);
+  }
+  const color = new THREE.Color().setHSL(hue, 0.85, 0.55);
+  ball.material.color.copy(color).multiplyScalar(0.35);
+  ball.material.emissive.copy(color);
+  ball.userData = { active: true, life: LIFE, pulse: 1.6 + gain * 1.0 };
+  ball.position.set(xPos, 0, 0);
+  ball.scale.setScalar(ball.userData.pulse);
+  return ball;
+}
+
+const grid = new THREE.GridHelper(20, 20, 0x0f3d1d, 0x061a0b);
+grid.position.y = -1.6;
+scene.add(grid);
+
+// ---- code overlay -----------------------------------------------------
+// strudel.cc の REPL エディタの中身を受信して、黒背景+screenブレンドで
+// three.js シーンの上に文字だけ浮かせて表示する独立機能。
+// viz.mjs（イベント可視化）とは責務を分離した新規関数として実装する。
+//
+// 解読エフェクト:
+// 行の内容が変化した（＝スクロールで新しく見えてきた／編集された）時、
+// その行はランダムな記号で約2秒間チラつきながら、少しずつ本来の文字へ
+// 収束していく。変化した行のうち一番上の行を基準に、下の行ほど開始が
+// 少し遅れるので、上から下へ解読が広がっていくように見える。
+const SCRAMBLE_CHARS =
+  'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}|;:,.<>?/~';
+
+function randomScrambleChar() {
+  return SCRAMBLE_CHARS[(Math.random() * SCRAMBLE_CHARS.length) | 0];
+}
+
+function createCodeOverlay(canvas, {
+  font = '17px "Courier New", monospace',
+  color = '#39ff6a',
+  highlightColor = '#ff5c5c',
+  lineHeight = 21,
+  padding = 16,
+  decryptDurationMs = 800,  // 1行あたりの解読にかける時間
+  lineStaggerMs = 40,       // 行ごとの開始ディレイ（上から下への広がり）
+} = {}) {
+  const ctx = canvas.getContext('2d');
+  let dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+  // 行ごとの状態: { target, resolveAt: number[], startTime, done }
+  let lineStates = [];
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = wrap.clientWidth * dpr;
+    canvas.height = wrap.clientHeight * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  // 新しい行データ（[{n, text}, ...]）を受け取り、前回との差分がある行だけ
+  // アニメーションを再始動する。nは絶対行番号（ハイライト対応付け用、
+  // 取得できない場合はnull）。
+  function setText(lines) {
+    const now = performance.now();
+    const nextStates = [];
+    let firstChangedIndex = -1;
+
+    for (let i = 0; i < lines.length; i++) {
+      const { n, text: target } = lines[i];
+      const prev = lineStates[i];
+      const changed = !prev || prev.target !== target;
+
+      if (!changed) {
+        prev.n = n; // 行番号だけはズレることがあるので毎回更新しておく
+        nextStates.push(prev);
+        continue;
+      }
+      if (firstChangedIndex === -1) firstChangedIndex = i;
+
+      // 文字ごとに解読完了タイミングをずらす（左から右へ緩やかに、乱数で自然に）
+      const len = target.length;
+      const resolveAt = new Array(len);
+      for (let j = 0; j < len; j++) {
+        if (target[j] === ' ') { resolveAt[j] = 0; continue; } // 空白は即確定（インデントの形を保つ）
+        const base = len > 1 ? (j / (len - 1)) : 0;
+        resolveAt[j] = base * decryptDurationMs * 0.6 + Math.random() * decryptDurationMs * 0.4;
+      }
+
+      nextStates.push({
+        n,
+        target,
+        resolveAt,
+        startTime: null, // firstChangedIndex確定後に一括セットする
+        done: len === 0,
+      });
+    }
+
+    // 変化した行のみ、firstChangedIndexからの相対位置でstartTimeを設定
+    if (firstChangedIndex !== -1) {
+      for (let i = firstChangedIndex; i < nextStates.length; i++) {
+        const st = nextStates[i];
+        if (st.startTime === null) {
+          st.startTime = now + (i - firstChangedIndex) * lineStaggerMs;
+        }
+      }
+    }
+
+    lineStates = nextStates;
+  }
+
+  // 「今光っている」座標情報（絶対行番号ベース）。highlight.mjsから届く
+  // {type:'highlight', ranges:[{line, startCol, endCol}, ...]}をそのまま
+  // 行番号ごとにグルーピングして持っておく。
+  let highlightsByLine = new Map();
+  function setHighlights(ranges) {
+    const next = new Map();
+    for (const r of ranges || []) {
+      if (!next.has(r.line)) next.set(r.line, []);
+      next.get(r.line).push(r);
+    }
+    highlightsByLine = next;
+  }
+
+  // 1行分をハイライト範囲に応じて色分けしながら描画する。
+  // 等幅フォント前提だが、区間ごとの実測幅(measureText)を積み上げているので
+  // フォントが厳密な等幅でなくてもズレない。
+  // 重なった/重複したrangeが複数来ても安全なように、事前にマージしておく。
+  // マージせずに順番通り描画すると、既に描画済みの区間を指す古いrangeが
+  // 後から来た際に「その時点のcurX」に「本来はもっと前にあるべき文字」を
+  // 描いてしまい、文字がズレて重複表示される不具合が起きていた。
+  function mergeRanges(ranges, textLen) {
+    const clipped = ranges
+      .map((r) => ({
+        s: Math.max(0, Math.min(r.startCol, textLen)),
+        e: Math.max(0, Math.min(r.endCol, textLen)),
+      }))
+      .filter((r) => r.e > r.s)
+      .sort((a, b) => a.s - b.s);
+
+    const merged = [];
+    for (const r of clipped) {
+      const last = merged[merged.length - 1];
+      if (last && r.s <= last.e) {
+        last.e = Math.max(last.e, r.e);
+      } else {
+        merged.push({ ...r });
+      }
+    }
+    return merged;
+  }
+
+  function drawLineWithHighlight(text, x, y, ranges) {
+    if (!ranges || ranges.length === 0) {
+      ctx.fillStyle = color;
+      ctx.fillText(text, x, y);
+      return;
+    }
+    const merged = mergeRanges(ranges, text.length);
+    if (merged.length === 0) {
+      ctx.fillStyle = color;
+      ctx.fillText(text, x, y);
+      return;
+    }
+    let cursor = 0;
+    let curX = x;
+    for (const { s, e } of merged) {
+      if (s > cursor) {
+        const seg = text.slice(cursor, s);
+        ctx.fillStyle = color;
+        ctx.fillText(seg, curX, y);
+        curX += ctx.measureText(seg).width;
+      }
+      const hseg = text.slice(s, e);
+      ctx.fillStyle = highlightColor;
+      ctx.fillText(hseg, curX, y);
+      curX += ctx.measureText(hseg).width;
+      cursor = e;
+    }
+    if (cursor < text.length) {
+      const seg = text.slice(cursor);
+      ctx.fillStyle = color;
+      ctx.fillText(seg, curX, y);
+    }
+  }
+
+  // 毎フレーム呼ばれる。現在時刻に応じて各行の表示文字列を組み立てて描画する
+  function tick(now) {
+    const w = wrap.clientWidth, h = wrap.clientHeight;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, w, h);
+    ctx.font = font;
+    ctx.textBaseline = 'top';
+
+    let anyActive = false;
+
+    lineStates.forEach((state, i) => {
+      if (!state) return;
+      const y = padding + i * lineHeight;
+
+      if (state.done) {
+        drawLineWithHighlight(state.target, padding, y, highlightsByLine.get(state.n));
+        return;
+      }
+
+      const elapsed = now - state.startTime;
+      if (elapsed < 0) {
+        // まだ開始前（下方向へのカスケード待ち）: 何も描かない
+        anyActive = true;
+        return;
+      }
+
+      if (elapsed >= decryptDurationMs) {
+        state.done = true;
+        drawLineWithHighlight(state.target, padding, y, highlightsByLine.get(state.n));
+        return;
+      }
+
+      anyActive = true;
+      let out = '';
+      for (let j = 0; j < state.target.length; j++) {
+        const ch = state.target[j];
+        if (ch === ' ' || elapsed >= state.resolveAt[j]) out += ch;
+        else out += randomScrambleChar();
+      }
+      // 解読中の行は少し明るさを落として「揺れている」感を出す
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.75 + Math.random() * 0.25;
+      ctx.fillText(out, padding, y);
+      ctx.globalAlpha = 1;
+    });
+
+    return anyActive;
+  }
+
+  function clear() {
+    lineStates = [];
+    highlightsByLine = new Map();
+    ctx.clearRect(0, 0, wrap.clientWidth, wrap.clientHeight);
+  }
+
+  resize();
+  return { setText, setHighlights, tick, clear, resize };
+}
+
+const codeOverlay = createCodeOverlay(codeCanvas);
+
+function onResize() {
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+  resizeScopeCanvas();
+  codeOverlay.resize();
+}
+window.addEventListener('resize', onResize);
+
+function hash01(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
+  return (h % 1000) / 1000;
+}
+
+function handleHap(hap) {
+  const v = hap.value || {};
+  const key = String(v.s ?? v.sound ?? 'x') + '|' + String(v.n ?? v.note ?? '');
+
+  const gain = typeof v.gain === 'number' ? v.gain : 0.8;
+  let hue = hash01(String(v.s ?? 'x'));
+  if (typeof v.note === 'number') hue = ((v.note % 12) + 12) % 12 / 12;
+  else if (typeof v.note === 'string') hue = hash01(v.note);
+
+  let xPos;
+  if (typeof v.note === 'number') xPos = (v.note % 24) - 12;
+  else xPos = (hash01(key) - 0.5) * 14;
+
+  spawnNoteBall(0.33 - hue * 0.15, xPos, gain);
+  hud.textContent = `${v.s ?? v.note ?? '?'}  gain=${gain.toFixed(2)}`;
+}
+
+// vizScope()（旧・destinationタップ方式、idなし）と vizScope2()
+// （analyze()方式、id付き・パターン単位で部分適用可能）の両方を
+// 同じ 'scope' メッセージ種別で受け、idごとに独立したレーンとして
+// 保持する。idが来ない場合は共通の DEFAULT_SCOPE_ID にまとめる
+// （旧vizScope()との後方互換）。
+const DEFAULT_SCOPE_ID = '_default';
+const waveById = new Map(); // id -> { wave, lastSeen }
+const SCOPE_STALE_MS = 2000; // このミリ秒間更新がなければレーンを消す
+
+function scopeColor(id) {
+  if (id === DEFAULT_SCOPE_ID) return { line: 'rgba(57, 255, 106, 0.85)', glow: 'rgba(57, 255, 106, 0.6)' };
+  const hue = hash01(id) * 360;
+  return { line: `hsla(${hue}, 90%, 62%, 0.85)`, glow: `hsla(${hue}, 90%, 62%, 0.6)` };
+}
+
+let smoothVolume = 0; // 全体の音量(RMS)をなめらかに保持する変数
+
+function handleScope(msg) {
+  if (!Array.isArray(msg.wave)) return;
+  const id = msg.id ?? DEFAULT_SCOPE_ID;
+  // msg.active が無ければ(=旧vizScope()からの受信) 常時表示扱いにする
+  const active = msg.active !== false;
+  waveById.set(id, { wave: msg.wave, active, lastSeen: performance.now() });
+}
+
+function drawScope() {
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  scopeCtx.clearRect(0, 0, w, h);
+
+  // 発音が止まった楽器のレーンはここで先に間引く
+  const now = performance.now();
+  for (const [id, entry] of waveById) {
+    if (now - entry.lastSeen > SCOPE_STALE_MS) waveById.delete(id);
+  }
+
+  // 鳴っていないレーンは帯そのものをレイアウトから外す
+  // (残った帯はその分だけ広がる)
+  const lanes = [...waveById.entries()].filter(
+    ([, entry]) => entry.active && entry.wave && entry.wave.length
+  );
+  if (lanes.length === 0) return;
+
+  const bandH = h / lanes.length;
+
+  scopeCtx.font = '10px "Courier New", monospace';
+  scopeCtx.textBaseline = 'alphabetic';
+
+  lanes.forEach(([id, entry], idx) => {
+    const wave = entry.wave;
+
+    const bandTop = idx * bandH;
+    const midY = bandTop + bandH * 0.5;
+    const amp = bandH * 0.42; // 帯の中に収まる振れ幅
+
+    // レーン同士の境界線（複数レーンのときだけ、薄く）
+    if (lanes.length > 1 && idx > 0) {
+      scopeCtx.beginPath();
+      scopeCtx.strokeStyle = 'rgba(57, 255, 106, 0.12)';
+      scopeCtx.shadowBlur = 0;
+      scopeCtx.lineWidth = 1;
+      scopeCtx.moveTo(0, bandTop);
+      scopeCtx.lineTo(w, bandTop);
+      scopeCtx.stroke();
+    }
+
+    // idラベル(複数レーンあるときだけ)
+    if (lanes.length > 1 && id !== DEFAULT_SCOPE_ID) {
+      const { line } = scopeColor(id);
+      scopeCtx.shadowBlur = 0;
+      scopeCtx.fillStyle = line;
+      scopeCtx.fillText(id, 6, bandTop + 12);
+    }
+
+    const { line, glow } = scopeColor(id);
+    scopeCtx.beginPath();
+    scopeCtx.lineWidth = 2;
+    scopeCtx.strokeStyle = line;
+    scopeCtx.shadowColor = glow;
+    scopeCtx.shadowBlur = 6;
+
+    wave.forEach((v, i) => {
+      const x = (i / (wave.length - 1)) * w;
+      const y = midY - v * amp;
+      if (i === 0) scopeCtx.moveTo(x, y);
+      else scopeCtx.lineTo(x, y);
+    });
+    scopeCtx.stroke();
+  });
+}
+
+let lastT = performance.now();
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = Math.min((now - lastT) / 1000, 0.1);
+  lastT = now;
+
+  for (const ball of notePool) {
+    if (!ball.userData.active) continue;
+    ball.userData.pulse += (1.0 - ball.userData.pulse) * Math.min(dt * 5, 1);
+    ball.position.z -= ROLL_SPEED * dt;
+    ball.userData.life -= dt;
+    const fade = Math.max(0, ball.userData.life / LIFE);
+    ball.scale.setScalar(ball.userData.pulse * (0.4 + fade * 0.6));
+    ball.material.emissiveIntensity = 1.6 * fade;
+    if (ball.userData.life <= 0) ball.userData.active = false;
+  }
+
+  // 波形の全体音量（RMS）を計算して、ライティングを少し揺らす
+  // 複数レーンある場合は全レーンをまとめて1つのRMSにする
+  let currentRms = 0;
+  if (waveById.size > 0) {
+    let sum = 0, count = 0;
+    for (const { wave } of waveById.values()) {
+      for (let i = 0; i < wave.length; i++) sum += wave[i] * wave[i];
+      count += wave.length;
+    }
+    if (count > 0) currentRms = Math.sqrt(sum / count);
+  }
+  
+  // 値をなめらかに追従させる
+  smoothVolume += (currentRms - smoothVolume) * 0.25;
+
+  // 3バンドの代わりに、全体の音量で光の演出を制御
+  pointLight.intensity = BASE_POINT_INTENSITY + smoothVolume * 15.0;
+  pointLight.distance = BASE_POINT_DISTANCE + smoothVolume * 50;
+  ambientLight.intensity = BASE_AMBIENT_INTENSITY + smoothVolume * 3.0;
+  scene.fog.density = Math.max(0.005, BASE_FOG_DENSITY - smoothVolume * 0.05);
+
+  drawScope();
+  codeOverlay.tick(now);
+  renderer.render(scene, camera);
+}
+animate();
+
+let ws = null;
+let reconnectTimer = null;
+
+function setStatus(text, live) {
+  statusText.textContent = text;
+  dot.className = live ? 'live' : '';
+}
+
+function connect() {
+  const url = wsUrlInput.value.trim();
+  if (!url) return;
+  if (ws) { try { ws.close(); } catch (e) {} }
+
+  setStatus('connecting...', false);
+  ws = new WebSocket(url);
+
+  ws.onopen = () => setStatus('connected — waiting for haps', true);
+  ws.onclose = (ev) => {
+    setStatus('disconnected — retrying in 2s', false);
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connect, 2000);
+  };
+  ws.onerror = () => setStatus('connection error', false);
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'scope') {
+        handleScope(msg);
+        return;
+      }
+      if (msg.type === 'code') {
+        codeOverlay.setText(msg.lines);
+        return;
+      }
+      if (msg.type === 'highlight') {
+        codeOverlay.setHighlights(msg.ranges);
+        return;
+      }
+      if (Array.isArray(msg)) msg.forEach(handleHap);
+      else if (Array.isArray(msg.haps)) msg.haps.forEach(handleHap);
+      else handleHap(msg);
+    } catch (e) {
+      console.warn('bad message', ev.data, e);
+    }
+  };
+}
+
+btnConnect.addEventListener('click', connect);
+connect();
+</script>
+</body>
+</html>
